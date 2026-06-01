@@ -11,3 +11,9 @@ librosa>=0.10.1
 soundfile>=0.12.1
 python-multipart>=0.0.9
 bcrypt>=4.0.1
+noisereduce>=3.0.2
+torch>=2.2.0
+deepfilternet>=0.5.0
+faster-whisper>=1.0.0
+jiwer>=3.0.3
+

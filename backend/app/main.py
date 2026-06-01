@@ -24,12 +24,19 @@ from app.auth import (
     require_admin
 )
 from app.kpi import mix_audio_at_snr, compute_kpis
+from app.enhancement_router import router as enhancement_router
+from app.transcription_router import router as transcription_router
+from app.enhancement_model import EnhancementRun
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Secure audio metrics calculations for DRDO air-gapped environments.",
     version="1.0.0"
 )
+
+# Register reverse-pipeline API routers
+app.include_router(enhancement_router)
+app.include_router(transcription_router)
 
 # Enable CORS for React development
 app.add_middleware(
