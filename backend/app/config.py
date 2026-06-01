@@ -3,17 +3,37 @@ import os
 class Settings:
     PROJECT_NAME: str = "DEAL Audio Quality Assessment Dashboard"
     
+    @staticmethod
+    def _get_secret(name: str, default: str) -> str:
+        # Check standard Docker secrets path first
+        secret_path = f"/run/secrets/{name}"
+        if os.path.exists(secret_path):
+            try:
+                with open(secret_path, "r") as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        return os.getenv(name, default)
+
     # Security Configurations
     # In production, this should be a strong random secret loaded from environment
-    JWT_SECRET: str = os.getenv("JWT_SECRET", "7f92a95e63b6510f277189f7833075c3efcd6a8d6b9e2491a62d04a625a6f23c")
+    @property
+    def JWT_SECRET(self) -> str:
+        return self._get_secret("JWT_SECRET", "7f92a95e63b6510f277189f7833075c3efcd6a8d6b9e2491a62d04a625a6f23c")
+
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
     # Database Configurations
     # Fallback to local SQLite file database inside the backend folder for easy local testing
-    POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
-    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "postgres")
+    @property
+    def POSTGRES_USER(self) -> str:
+        return self._get_secret("POSTGRES_USER", "postgres")
+        
+    @property
+    def POSTGRES_PASSWORD(self) -> str:
+        return self._get_secret("POSTGRES_PASSWORD", "postgres")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "deal_dashboard")
     POSTGRES_HOST: str = os.getenv("POSTGRES_HOST", "db")
     POSTGRES_PORT: str = os.getenv("POSTGRES_PORT", "5432")

@@ -6,12 +6,14 @@ import soundfile as sf
 import librosa
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, desc
+from typing import Optional
 
 from app.config import settings
-from app.database import engine, Base, get_db
+from app.database import engine, Base, get_db, AsyncSessionLocal
 from app.models import User, Run, ActiveSession
 from app.auth import (
     hash_password,
@@ -21,8 +23,11 @@ from app.auth import (
     get_current_user,
     require_analyst,
     require_supervisor,
-    require_admin
+    require_admin,
+    refresh_jwt_key_cache,
+    decode_token
 )
+from app.audit import setup_audit_triggers, log_event
 from app.kpi import mix_audio_at_snr, compute_kpis
 from app.enhancement_router import router as enhancement_router
 from app.transcription_router import router as transcription_router
@@ -34,9 +39,78 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Register reverse-pipeline API routers
-app.include_router(enhancement_router)
-app.include_router(transcription_router)
+# ----------------- AUDIT LOG MIDDLEWARE -----------------
+class AuditLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # We only log requests going to /api
+        if not request.url.path.startswith("/api"):
+            return await call_next(request)
+            
+        client_ip = request.client.host if request.client else "unknown"
+        
+        # Try to extract the user's username
+        username = "anonymous"
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            try:
+                payload = decode_token(token)
+                username = payload.get("sub", "anonymous")
+            except Exception:
+                pass
+                
+        event_type = f"ATTEMPT_{request.method}"
+        resource = request.url.path
+        
+        # Log attempt
+        async with AsyncSessionLocal() as db_session:
+            try:
+                await log_event(
+                    db=db_session,
+                    event_type=event_type,
+                    username=username,
+                    ip_address=client_ip,
+                    resource=resource
+                )
+            except Exception as e:
+                print(f"[AUDIT ERROR] Failed to log attempt: {e}")
+                
+        # Call next handler
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+        except Exception as e:
+            # Log backend crash
+            async with AsyncSessionLocal() as db_session:
+                try:
+                    await log_event(
+                        db=db_session,
+                        event_type="SERVER_CRASH",
+                        username=username,
+                        ip_address=client_ip,
+                        resource=f"{resource} | Error: {str(e)[:100]}"
+                    )
+                except Exception:
+                    pass
+            raise e
+            
+        # Log outcome
+        event_outcome = "SUCCESS" if status_code < 400 else f"CLIENT_ERROR_{status_code}" if status_code < 500 else "SERVER_ERROR"
+        async with AsyncSessionLocal() as db_session:
+            try:
+                await log_event(
+                    db=db_session,
+                    event_type=event_outcome,
+                    username=username,
+                    ip_address=client_ip,
+                    resource=f"{resource} | Status: {status_code}"
+                )
+            except Exception as e:
+                print(f"[AUDIT ERROR] Failed to log outcome: {e}")
+                
+        return response
+
+app.add_middleware(AuditLogMiddleware)
 
 # Enable CORS for React development
 app.add_middleware(
@@ -47,15 +121,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register reverse-pipeline API routers
+app.include_router(enhancement_router)
+app.include_router(transcription_router)
+
 @app.on_event("startup")
 async def startup_event():
-    """Create database tables and seed default users on startup."""
+    """Create database tables, seed default users, register triggers and caches on startup."""
     async with engine.begin() as conn:
         # Create all tables async
         await conn.run_sync(Base.metadata.create_all)
+        # Register audit immutability triggers
+        await setup_audit_triggers(conn)
     
     # Seed default roles if users table is empty
     async with AsyncSession(engine) as session:
+        # Seed JWT Key and refresh in-memory cache
+        await refresh_jwt_key_cache(session)
+        
         result = await session.execute(select(func.count(User.id)))
         count = result.scalar()
         if count == 0:
@@ -171,18 +254,69 @@ async def run_audio_analysis(
     clean_file: UploadFile = File(...),
     noise_type: str = Form(...),
     snr_db: float = Form(...),
+    project_id: Optional[int] = Form(None),
+    force_run: bool = Form(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_analyst)
 ):
     """
-    Perform SNR, PESQ, and STOI quality calculation.
-    Automatically handles resampling on standard audio files using our safety layer.
+    Perform SNR, PESQ, STOI, and reference-free DNSMOS speech quality calculations.
+    Includes rate limiting, project scoping, duplicate checks, and windowed spectrographs.
     """
-    # 1. Read clean audio input file
+    from app.auth import check_rate_limit
+    from app.models import ProjectMembership
+    from app.kpi import compute_dnsmos
+    from sqlalchemy import delete
+    import hashlib
+    
+    # 1. Enforce per-user hourly rate limits
+    check_rate_limit(current_user)
+    
+    # 2. Scoped Project validation
+    if current_user.role != "admin":
+        pm_res = await db.execute(select(ProjectMembership).where(ProjectMembership.user_id == current_user.id))
+        user_projects = [m.project_id for m in pm_res.scalars().all()]
+        if project_id:
+            if project_id not in user_projects:
+                raise HTTPException(status_code=403, detail="Access to specified project is forbidden.")
+            assigned_project_id = project_id
+        else:
+            if not user_projects:
+                raise HTTPException(status_code=403, detail="You must belong to at least one project to run analysis.")
+            assigned_project_id = user_projects[0]
+    else:
+        assigned_project_id = project_id
+        
+    # 3. Read clean audio input file
     file_bytes = await clean_file.read()
     
+    # Calculate SHA-256 raw file integrity hash
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    
+    # 4. Duplicate Check
+    if not force_run:
+        dup_res = await db.execute(select(Run).where(Run.file_hash == file_hash))
+        dup_run = dup_res.scalars().first()
+        if dup_run:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "This file was previously analyzed.",
+                    "run_id": dup_run.id,
+                    "clean_file_name": dup_run.clean_file_name,
+                    "date": dup_run.timestamp.isoformat(),
+                    "pesq_score": dup_run.pesq_score,
+                    "stoi_score": dup_run.stoi_score,
+                    "final_snr": dup_run.final_snr
+                }
+            )
+    else:
+        # Clear existing unique constraint run if forced
+        await db.execute(delete(Run).where(Run.file_hash == file_hash))
+        await db.commit()
+        
     try:
-        # Load audio using soundfile
+        # Load audio using soundfile safely
         audio_io = io.BytesIO(file_bytes)
         clean_data, fs = sf.read(audio_io)
     except Exception as e:
@@ -195,41 +329,43 @@ async def run_audio_analysis(
     if len(clean_data.shape) > 1:
         clean_data = np.mean(clean_data, axis=1)
         
-    # 2. Mix with selected noise type at selected SNR
+    # 5. Mix with selected noise type at selected SNR
     mixed_data, scaled_noise, actual_snr = mix_audio_at_snr(clean_data, noise_type, snr_db, fs)
     
-    # 3. Compute Quality Assessment KPIs
+    # 6. Compute Quality Assessment KPIs + DNSMOS reference-free subscores
     snr_val, pesq_val, stoi_val = compute_kpis(clean_data, mixed_data, fs, noise_type, snr_db)
+    sig_mos, bak_mos, ovr_mos = compute_dnsmos(mixed_data, fs)
     
-    # 4. Downsample waveforms for highly optimized UI rendering (e.g. 400 peaks)
+    # 7. Downsample waveforms for highly optimized UI rendering (e.g. 400 peaks)
     max_peaks = 400
     step = max(1, len(clean_data) // max_peaks)
-    
-    # Downsample using peak envelope calculation
     clean_peaks = [float(np.max(np.abs(clean_data[i:i+step]))) for i in range(0, len(clean_data), step)][:max_peaks]
     mixed_peaks = [float(np.max(np.abs(mixed_data[i:i+step]))) for i in range(0, len(mixed_data), step)][:max_peaks]
     
-    # 5. Generate high-fidelity compact spectrogram data for UI Canvas
-    # Compute Short Time Fourier Transform (STFT)
-    stft_matrix = np.abs(librosa.stft(clean_data, n_fft=512, hop_length=256))
+    # 8. Memory-optimized Windowed Spectrogram Generation
+    # If audio is extremely long, slide/decimate to maximum of 160,000 samples (10s at 16kHz)
+    max_samples = 160000
+    spec_data = clean_data
+    if len(clean_data) > max_samples:
+        ds_step = len(clean_data) // max_samples
+        spec_data = clean_data[::ds_step]
+        
+    stft_matrix = np.abs(librosa.stft(spec_data, n_fft=512, hop_length=256))
     stft_db = librosa.amplitude_to_db(stft_matrix, ref=np.max)
     
-    # Downsample matrix dimensions to 80 time steps x 40 frequency bands for highly compact JSON loading
+    # Downsample matrix dimensions to 80 time steps x 40 frequency bands
     spectrogram_height = 40
     spectrogram_width = 80
-    
-    # Downsample along frequency (rows) and time (columns)
     freq_indices = np.linspace(0, stft_db.shape[0] - 1, spectrogram_height, dtype=int)
     time_indices = np.linspace(0, stft_db.shape[1] - 1, spectrogram_width, dtype=int)
-    
     compact_spec = stft_db[freq_indices, :][:, time_indices]
     
-    # Normalize spectrogram between 0.0 and 1.0 for rendering gradient maps
+    # Normalize spectrogram
     min_db, max_db = np.min(compact_spec), np.max(compact_spec)
     db_range = max_db - min_db if max_db > min_db else 1.0
     normalized_spec = ((compact_spec - min_db) / db_range).tolist()
     
-    # 6. Save Run record in DB for audit trail
+    # 9. Save Run record in DB for audit trail
     run_record = Run(
         analyst_id=current_user.id,
         analyst_username=current_user.username,
@@ -238,7 +374,12 @@ async def run_audio_analysis(
         snr_db=snr_db,
         pesq_score=round(pesq_val, 3),
         stoi_score=round(stoi_val, 3),
-        final_snr=round(snr_val, 2)
+        final_snr=round(snr_val, 2),
+        file_hash=file_hash,
+        project_id=assigned_project_id,
+        dnsmos_sig=sig_mos,
+        dnsmos_bak=bak_mos,
+        dnsmos_ovr=ovr_mos
     )
     db.add(run_record)
     await db.commit()
@@ -253,6 +394,11 @@ async def run_audio_analysis(
         "final_snr": round(snr_val, 2),
         "fs": fs,
         "duration": float(len(clean_data) / fs),
+        "file_hash": file_hash,
+        "project_id": assigned_project_id,
+        "dnsmos_sig": sig_mos,
+        "dnsmos_bak": bak_mos,
+        "dnsmos_ovr": ovr_mos,
         "clean_waveform": clean_peaks,
         "mixed_waveform": mixed_peaks,
         "spectrogram": normalized_spec
@@ -266,14 +412,26 @@ async def get_all_runs(
     noise_type: Optional[str] = None,
     min_snr: Optional[float] = None,
     max_snr: Optional[float] = None,
+    project_id: Optional[int] = None,
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_supervisor)
 ):
-    """Retrieve audit history logs of all metrics runs. Filterable and sortable."""
+    """Retrieve audit history logs of all metrics runs. Enforces Project Membership Isolation."""
+    from app.models import ProjectMembership
     query = select(Run)
     
+    # Enforce data isolation filtering
+    if current_user.role != "admin":
+        pm_res = await db.execute(select(ProjectMembership).where(ProjectMembership.user_id == current_user.id))
+        user_projects = [m.project_id for m in pm_res.scalars().all()]
+        query = query.where(Run.project_id.in_(user_projects))
+        if project_id and project_id not in user_projects:
+            raise HTTPException(status_code=403, detail="Access denied to requested project scope.")
+    elif project_id:
+        query = query.where(Run.project_id == project_id)
+        
     # Apply supervisors filters
     if analyst_username:
         query = query.where(Run.analyst_username.like(f"%{analyst_username}%"))
@@ -409,3 +567,31 @@ async def delete_user(
     await db.delete(user)
     await db.commit()
     return {"detail": "User deleted successfully"}
+
+@app.post("/api/auth/rotate-keys")
+async def rotate_jwt_keys(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """Admin-only endpoint to rotate the active JWT signing key on demand."""
+    import secrets
+    new_secret = secrets.token_hex(32)
+    
+    result = await db.execute(select(func.max(JwtKey.version)))
+    max_ver = result.scalar() or 0
+    new_ver = max_ver + 1
+    
+    new_key = JwtKey(version=new_ver, secret=new_secret)
+    db.add(new_key)
+    await db.commit()
+    
+    await refresh_jwt_key_cache(db)
+    
+    await log_event(
+        db=db,
+        event_type="KEY_ROTATION",
+        username=current_user.username,
+        resource=f"Rotated JWT key to version {new_ver}"
+    )
+    
+    return {"detail": f"JWT signing key rotated successfully to version {new_ver}"}
