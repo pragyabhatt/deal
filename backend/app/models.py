@@ -117,3 +117,32 @@ class BatchRun(Base):
     failed_files = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+
+class Job(Base):
+    __tablename__ = "jobs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    analyst_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    job_type = Column(String, nullable=False)  # "enhance", "combined", "transcribe"
+    status = Column(String, default="queued", index=True)  # queued, processing, completed, failed
+    method = Column(String, nullable=True)
+    language = Column(String, nullable=True)
+    input_file_path = Column(String, nullable=True)
+    output_file_path = Column(String, nullable=True)
+    
+    # Run stats (PESQ, STOI, etc.)
+    pesq_before = Column(Float, nullable=True)
+    pesq_after = Column(Float, nullable=True)
+    stoi_before = Column(Float, nullable=True)
+    stoi_after = Column(Float, nullable=True)
+    snr_improvement = Column(Float, nullable=True)
+    wer_before = Column(Float, nullable=True)
+    wer_after = Column(Float, nullable=True)
+    
+    results_json = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)
+
+

@@ -187,3 +187,42 @@ def check_rate_limit(user: User):
         )
         
     timestamps.append(now)
+
+
+# IP rate limiting hourly tracker
+ip_rate_tracker: Dict[str, List[datetime.datetime]] = {}
+
+def check_ip_rate_limit(ip_address: str):
+    """Enforces 100 requests per hour limit per IP address across endpoints."""
+    now = datetime.datetime.utcnow()
+    timestamps = ip_rate_tracker.setdefault(ip_address, [])
+    
+    one_hour_ago = now - datetime.timedelta(hours=1)
+    timestamps = [t for t in timestamps if t > one_hour_ago]
+    ip_rate_tracker[ip_address] = timestamps
+    
+    if len(timestamps) >= 100:
+        reset_time = timestamps[0] + datetime.timedelta(hours=1)
+        retry_after = int((reset_time - now).total_seconds())
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"IP hourly rate limit exceeded. Limit is 100 requests per hour. Please try again in {retry_after} seconds."
+        )
+    timestamps.append(now)
+
+
+async def check_concurrent_jobs_limit(user_id: int, db: AsyncSession):
+    """Enforces max 10 concurrent active/queued jobs per user."""
+    from app.models import Job
+    stmt = select(func.count(Job.id)).where(
+        Job.analyst_id == user_id,
+        Job.status.in_(["queued", "processing"])
+    )
+    result = await db.execute(stmt)
+    count = result.scalar()
+    if count >= 10:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many concurrent jobs. You can have at most 10 active jobs running or queued."
+        )
+

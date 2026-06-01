@@ -2,21 +2,28 @@ import datetime
 import io
 import os
 import base64
+import json
 import numpy as np
 import soundfile as sf
 import librosa
 import logging
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, desc
 
 from app.database import get_db
-from app.models import User
+from app.models import User, Job
 from app.enhancement_model import EnhancementRun
-from app.auth import require_analyst, require_supervisor
+from app.auth import (
+    require_analyst,
+    require_supervisor,
+    check_ip_rate_limit,
+    check_concurrent_jobs_limit
+)
 from app.kpi import resample_audio
+from app.jobs import job_queue, validate_and_strip_audio, UPLOADS_DIR
 
 # Setup logging
 logger = logging.getLogger("enhancement_router")
@@ -101,142 +108,69 @@ def run_dsp_spectral_subtraction(noisy_data: np.ndarray, fs: int = 16000) -> np.
 
 @router.post("/enhance")
 async def enhance_audio(
+    request: Request,
     file: UploadFile = File(...),
     method: str = Form(...), # "fast" or "deep"
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_analyst)
 ):
     """
-    Accepts a noisy WAV file, resamples to 16kHz, performs denoising,
-    computes SNR and quality indexes, and returns base64 enhanced WAV + KPI metrics.
+    Accepts a noisy audio file, validates constraints, strips metadata,
+    creates a background restoration job, and returns the queued Job ID.
     """
-    # 1. Read noisy audio bytes
-    file_bytes = await file.read()
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    check_ip_rate_limit(client_ip)
+    await check_concurrent_jobs_limit(current_user.id, db)
     
-    try:
-        audio_io = io.BytesIO(file_bytes)
-        noisy_data, fs = sf.read(audio_io)
-    except Exception as e:
+    # Whitelist check
+    method_used = method.lower()
+    if method_used not in ["fast", "deep"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid WAV file format. Error: {str(e)}"
+            detail="Invalid method. Allowed methods: fast, deep"
         )
         
-    # Standardize to mono
-    if len(noisy_data.shape) > 1:
-        noisy_data = np.mean(noisy_data, axis=1)
+    file_bytes = await file.read()
+    try:
+        raw_data, fs = validate_and_strip_audio(file_bytes, file.filename)
+    except ValueError as val_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(val_err)
+        )
         
-    # Resample to 16kHz standard
-    noisy_16k = resample_audio(noisy_data, fs, 16000)
+    # Save clean stripped version to uploads dir
+    import uuid
+    safe_filename = f"{uuid.uuid4()}_{file.filename}"
+    input_path = os.path.join(UPLOADS_DIR, safe_filename)
+    sf.write(input_path, raw_data, fs, format='WAV', subtype='PCM_16')
     
-    # Estimate baseline SNR before enhancement
-    snr_before = estimate_single_channel_snr(noisy_16k)
-    pesq_before, stoi_before = estimate_pesq_stoi_from_snr(snr_before)
+    # Create DB Job entry
+    job = Job(
+        analyst_id=current_user.id,
+        job_type="enhance",
+        status="queued",
+        method=method_used,
+        input_file_path=input_path
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
     
-    # 2. Run Denoising Algorithm
-    enhanced_16k = None
-    method_used = method.lower()
-    
-    if method_used == "deep":
-        try:
-            # Attempt DeepFilterNet enhancement
-            import torch
-            from df.enhance import init_df, enhance
-            
-            # Temporary files to use DeepFilterNet file API safely
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_in, \
-                 tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_out:
-                
-                temp_in_name = temp_in.name
-                temp_out_name = temp_out.name
-                
-                # Write 16kHz noisy audio to temp file
-                sf.write(temp_in_name, noisy_16k, 16000)
-                
-            # Initialize & run DeepFilterNet
-            model, df_state, _ = init_df()
-            enhance(model, df_state, temp_in_name, temp_out_name)
-            
-            # Load enhanced audio back
-            enhanced_16k, fs_enhanced = sf.read(temp_out_name)
-            
-            # Cleanup temp files
-            os.remove(temp_in_name)
-            os.remove(temp_out_name)
-            logger.info("Successfully enhanced audio using DeepFilterNet.")
-        except Exception as e:
-            logger.warning(f"DeepFilterNet failed or not available: {e}. Falling back to Fast (DSP) spectral subtraction.")
-            enhanced_16k = run_dsp_spectral_subtraction(noisy_16k, 16000)
-            method_used = "deep (DSP fallback)"
-    else:
-        # Fast mode: try noisereduce, fallback to custom DSP spectral subtraction
-        try:
-            import noisereduce as nr
-            enhanced_16k = nr.reduce_noise(y=noisy_16k, sr=16000)
-            logger.info("Successfully enhanced audio using noisereduce.")
-        except Exception as e:
-            logger.warning(f"noisereduce failed or not available: {e}. Running custom DSP spectral subtraction.")
-            enhanced_16k = run_dsp_spectral_subtraction(noisy_16k, 16000)
-            method_used = "fast (DSP fallback)"
-            
-    # Normalize enhanced audio
-    if np.max(np.abs(enhanced_16k)) > 0:
-        enhanced_16k = enhanced_16k / np.max(np.abs(enhanced_16k)) * 0.9
-        
-    # Estimate metrics after enhancement
-    snr_after = estimate_single_channel_snr(enhanced_16k)
-    # Ensure enhancement actually shows logical positive change
-    if snr_after <= snr_before:
-        snr_after = snr_before + np.random.uniform(4.5, 8.2)
-        
-    pesq_after, stoi_after = estimate_pesq_stoi_from_snr(snr_after)
-    
-    snr_improvement = float(snr_after - snr_before)
-    
-    # 3. Waveform envelopes for UI comparison (400 peaks)
-    max_peaks = 400
-    step = max(1, len(noisy_16k) // max_peaks)
-    noisy_peaks = [float(np.max(np.abs(noisy_16k[i:i+step]))) for i in range(0, len(noisy_16k), step)][:max_peaks]
-    enhanced_peaks = [float(np.max(np.abs(enhanced_16k[i:i+step]))) for i in range(0, len(enhanced_16k), step)][:max_peaks]
-    
-    # 4. Generate Spectrograms for both signals
-    def get_compact_spectrogram(data):
-        stft_matrix = np.abs(librosa.stft(data, n_fft=512, hop_length=256))
-        stft_db = librosa.amplitude_to_db(stft_matrix, ref=np.max)
-        freq_indices = np.linspace(0, stft_db.shape[0] - 1, 40, dtype=int)
-        time_indices = np.linspace(0, stft_db.shape[1] - 1, 80, dtype=int)
-        compact_spec = stft_db[freq_indices, :][:, time_indices]
-        min_db, max_db = np.min(compact_spec), np.max(compact_spec)
-        db_range = max_db - min_db if max_db > min_db else 1.0
-        return ((compact_spec - min_db) / db_range).tolist()
-        
-    noisy_spec = get_compact_spectrogram(noisy_16k)
-    enhanced_spec = get_compact_spectrogram(enhanced_16k)
-    
-    # 5. Encode enhanced audio back to standard WAV bytes (base64 for browser play/download)
-    wav_io = io.BytesIO()
-    sf.write(wav_io, enhanced_16k, 16000, format='WAV', subtype='PCM_16')
-    wav_bytes = wav_io.getvalue()
-    enhanced_base64 = base64.b64encode(wav_bytes).decode('utf-8')
+    # Push to asyncio queue
+    await job_queue.put(job.id)
+    logger.info(f"Queued enhancement job #{job.id} for file {file.filename}")
     
     return {
-        "uploaded_filename": file.filename,
-        "enhancement_method": method_used,
-        "pesq_before": round(pesq_before, 3),
-        "pesq_after": round(pesq_after, 3),
-        "stoi_before": round(stoi_before, 3),
-        "stoi_after": round(stoi_after, 3),
-        "snr_improvement": round(snr_improvement, 2),
-        "duration": float(len(noisy_16k) / 16000),
-        "noisy_waveform": noisy_peaks,
-        "enhanced_waveform": enhanced_peaks,
-        "noisy_spectrogram": noisy_spec,
-        "enhanced_spectrogram": enhanced_spec,
-        "enhanced_audio": enhanced_base64
+        "job_id": job.id,
+        "status": job.status,
+        "job_type": job.job_type,
+        "created_at": job.created_at.isoformat()
     }
 
 @router.post("/combined")
 async def combined_pipeline(
+    request: Request,
     file: UploadFile = File(...),
     method: str = Form(...), # "fast" or "deep"
     language: str = Form(...), # "en", "hi", "auto"
@@ -244,92 +178,98 @@ async def combined_pipeline(
     current_user: User = Depends(require_analyst)
 ):
     """
-    Combined reverse pipeline:
-    1. Enhance noisy recording (16kHz).
-    2. Transcribe both original noisy and enhanced versions using Whisper locally.
-    3. Compute Word Error Rate (WER) using Levenshtein fallback / jiwer.
-    4. Save audit log to 'enhancement_runs' database table.
-    5. Return comparative scores, transcripts, waveforms, spectrograms, and WAV audio download.
+    Combined reverse pipeline: enqueues audio for serial enhancement and transcription.
     """
-    # Step 1: Run audio enhancement
-    enhance_res = await enhance_audio(file=file, method=method, current_user=current_user)
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    check_ip_rate_limit(client_ip)
+    await check_concurrent_jobs_limit(current_user.id, db)
     
-    # Step 2: Perform transcription on both signals
-    # We will import the transcription helpers
-    from app.transcription_router import transcribe_wav_buffer
-    
-    # Original noisy audio bytes
-    await file.seek(0)
-    noisy_bytes = await file.read()
-    
-    # Enhanced audio bytes (decode base64)
-    enhanced_bytes = base64.b64decode(enhance_res["enhanced_audio"])
-    
-    # Run offline transcriptions
-    noisy_transcript_res = await transcribe_wav_buffer(noisy_bytes, language)
-    enhanced_transcript_res = await transcribe_wav_buffer(enhanced_bytes, language)
-    
-    # Step 3: Compute Word Error Rate (WER)
-    # Using the enhanced transcript as reference, compute noisy WER
-    ref_text = enhanced_transcript_res["text"]
-    hyp_text = noisy_transcript_res["text"]
-    
-    wer_before = 0.0
-    wer_after = 0.0
-    
-    if ref_text.strip():
-        try:
-            import jiwer
-            wer_before = float(jiwer.wer(ref_text, hyp_text))
-        except Exception:
-            # Pure Python Levenshtein fallback
-            ref_words = ref_text.split()
-            hyp_words = hyp_text.split()
-            if ref_words:
-                d = np.zeros((len(ref_words) + 1, len(hyp_words) + 1))
-                for i in range(len(ref_words) + 1): d[i][0] = i
-                for j in range(len(hyp_words) + 1): d[0][j] = j
-                for i in range(1, len(ref_words) + 1):
-                    for j in range(1, len(hyp_words) + 1):
-                        if ref_words[i-1] == hyp_words[j-1]:
-                            d[i][j] = d[i-1][j-1]
-                        else:
-                            d[i][j] = min(d[i-1][j-1]+1, d[i][j-1]+1, d[i-1][j]+1)
-                wer_before = float(d[len(ref_words)][len(hyp_words)] / len(ref_words))
-    else:
-        # If enhanced transcript is empty, simulate a realistic WER diff
-        wer_before = 0.45
+    # Whitelists check
+    method_used = method.lower()
+    if method_used not in ["fast", "deep"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid method. Allowed methods: fast, deep"
+        )
+    lang_used = language.lower()
+    if lang_used not in ["en", "hi", "auto"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid language. Allowed languages: en, hi, auto"
+        )
         
-    # Enhanced signal WER vs its own transcript is naturally 0.0%
-    wer_after = 0.0
+    file_bytes = await file.read()
+    try:
+        raw_data, fs = validate_and_strip_audio(file_bytes, file.filename)
+    except ValueError as val_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(val_err)
+        )
+        
+    # Save clean stripped version to uploads dir
+    import uuid
+    safe_filename = f"{uuid.uuid4()}_{file.filename}"
+    input_path = os.path.join(UPLOADS_DIR, safe_filename)
+    sf.write(input_path, raw_data, fs, format='WAV', subtype='PCM_16')
     
-    # Step 4: Write enhancement run audit to DB
-    run_record = EnhancementRun(
+    # Create DB Job entry
+    job = Job(
         analyst_id=current_user.id,
-        analyst_username=current_user.username,
-        uploaded_filename=file.filename,
-        enhancement_method=enhance_res["enhancement_method"],
-        pesq_before=enhance_res["pesq_before"],
-        pesq_after=enhance_res["pesq_after"],
-        stoi_before=enhance_res["stoi_before"],
-        stoi_after=enhance_res["stoi_after"],
-        snr_improvement=enhance_res["snr_improvement"],
-        wer_before=round(wer_before, 3),
-        wer_after=round(wer_after, 3),
-        transcript_text=ref_text
+        job_type="combined",
+        status="queued",
+        method=method_used,
+        language=lang_used,
+        input_file_path=input_path
     )
-    db.add(run_record)
+    db.add(job)
     await db.commit()
+    await db.refresh(job)
+    
+    # Push to asyncio queue
+    await job_queue.put(job.id)
+    logger.info(f"Queued combined pipeline job #{job.id} for file {file.filename}")
     
     return {
-        "id": run_record.id,
-        **enhance_res,
-        "wer_before": round(wer_before, 3),
-        "wer_after": round(wer_after, 3),
-        "noisy_transcript": noisy_transcript_res,
-        "enhanced_transcript": enhanced_transcript_res,
-        "timestamp": run_record.timestamp.isoformat()
+        "job_id": job.id,
+        "status": job.status,
+        "job_type": job.job_type,
+        "created_at": job.created_at.isoformat()
     }
+
+@router.get("/jobs/{job_id}")
+async def get_job_status(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_analyst)
+):
+    """
+    Checks the status of a background job. If completed, returns the full results payload.
+    """
+    stmt = select(Job).where(Job.id == job_id)
+    res = await db.execute(stmt)
+    job = res.scalars().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    # Check if analyst owns the job or is supervisor/admin
+    if job.analyst_id != current_user.id and current_user.role not in ["supervisor", "admin"]:
+        raise HTTPException(status_code=403, detail="Access denied to this job record.")
+        
+    response = {
+        "job_id": job.id,
+        "job_type": job.job_type,
+        "status": job.status,
+        "error_message": job.error_message,
+        "created_at": job.created_at.isoformat(),
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None
+    }
+    
+    if job.status == "completed" and job.results_json:
+        response["result"] = json.loads(job.results_json)
+        
+    return response
+
 
 # ----------------- SUPERVISOR RUN AUDITS -----------------
 
