@@ -23,7 +23,8 @@ from app.auth import (
     check_concurrent_jobs_limit
 )
 from app.kpi import resample_audio
-from app.jobs import job_queue, validate_and_strip_audio, UPLOADS_DIR
+from app.jobs import job_queue
+from app.utils import validate_and_strip_audio, UPLOADS_DIR
 
 # Setup logging
 logger = logging.getLogger("enhancement_router")

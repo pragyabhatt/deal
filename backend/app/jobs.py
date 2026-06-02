@@ -18,23 +18,29 @@ import torch
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.utils import (
+    validate_and_strip_audio,
+    sanitize_transcription_text,
+    run_deepfilter_enhancement,
+    run_whisper_transcription
+)
+
 from app.database import AsyncSessionLocal
 from app.models import Job, User
 from app.enhancement_model import EnhancementRun
 from app.kpi import resample_audio
-from app.enhancement_router import (
+from app.utils import (
     estimate_single_channel_snr,
     estimate_pesq_stoi_from_snr,
-    run_dsp_spectral_subtraction
+    run_dsp_spectral_subtraction,
+    get_compact_spectrogram,
 )
 
 # Setup logger
 logger = logging.getLogger("jobs_worker")
 
 # Internal uploads and results directory
-MEDIA_DIR = os.getenv("MEDIA_DIR", "./media")
-UPLOADS_DIR = os.path.join(MEDIA_DIR, "uploads")
-RESULTS_DIR = os.path.join(MEDIA_DIR, "results")
+from app.utils import MEDIA_DIR, UPLOADS_DIR, RESULTS_DIR
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -44,235 +50,9 @@ job_queue = asyncio.Queue()
 
 # ----------------- SECURITY UTILITIES -----------------
 
-def validate_and_strip_audio(file_bytes: bytes, filename: str) -> Tuple[np.ndarray, int]:
-    """
-    Enforces maximum upload size of 500MB, validates format using magic bytes,
-    and strips metadata by extracting raw audio samples.
-    Returns (raw_samples, sample_rate).
-    """
-    MAX_SIZE = 500 * 1024 * 1024
-    if len(file_bytes) > MAX_SIZE:
-        raise ValueError("File size exceeds the maximum limit of 500 MB.")
-        
-    # Check Magic Bytes
-    is_wav = len(file_bytes) >= 12 and file_bytes[0:4] == b'RIFF' and file_bytes[8:12] == b'WAVE'
-    
-    is_mp3 = file_bytes.startswith(b'ID3') or \
-             file_bytes.startswith(b'\xff\xfb') or \
-             file_bytes.startswith(b'\xff\xf3') or \
-             file_bytes.startswith(b'\xff\xf2')
-             
-    is_m4a = len(file_bytes) >= 12 and file_bytes[4:8] == b'ftyp'
-    
-    if not (is_wav or is_mp3 or is_m4a):
-        raise ValueError("Invalid file format. Only WAV, MP3, and M4A formats are supported.")
-        
-    try:
-        if is_wav:
-            try:
-                audio_io = io.BytesIO(file_bytes)
-                data, fs = sf.read(audio_io)
-                if len(data.shape) > 1:
-                    data = np.mean(data, axis=1)
-                return data, fs
-            except Exception:
-                pass  # Fall back to librosa if soundfile fails
-                
-        # Use tempfile to parse MP3/M4A via librosa (or soundfile fallback)
-        suffix = os.path.splitext(filename)[1].lower()
-        if suffix not in [".wav", ".mp3", ".m4a"]:
-            suffix = ".wav"  # Default
-            
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            temp_file.write(file_bytes)
-            temp_path = temp_file.name
-            
-        try:
-            data, fs = librosa.load(temp_path, sr=None)
-            # Standardize multi-channel to mono
-            if len(data.shape) > 1:
-                data = np.mean(data, axis=1)
-            return data, fs
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                
-    except Exception as e:
-        logger.error(f"Audio decoding failure: {e}")
-        raise ValueError(f"Failed to decode audio file. Error: {str(e)}")
-
-
-def sanitize_transcription_text(text: str) -> str:
-    """
-    Sanitizes transcription text: caps length, strips control chars, and escapes special quotes.
-    """
-    if not text:
-        return ""
-    # Cap length at 1,000,000 characters
-    if len(text) > 1000000:
-        text = text[:1000000]
-    # Remove control characters
-    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', text)
-    return text
-
 # ----------------- DYNAMIC MODEL MANAGERS -----------------
 
-def run_deepfilter_enhancement(noisy_16k: np.ndarray) -> np.ndarray:
-    """
-    Loads DeepFilterNet on-demand, enhances audio, and unloads model to free GPU VRAM/RAM.
-    """
-    logger.info("On-demand loading DeepFilterNet model...")
-    try:
-        from df.enhance import init_df, enhance
-        
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_in, \
-             tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_out:
-            temp_in_path = temp_in.name
-            temp_out_path = temp_out.name
-            
-        try:
-            sf.write(temp_in_path, noisy_16k, 16000)
-            
-            # Initialize DF on CPU or CUDA depending on PyTorch configuration
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Initializing DeepFilterNet on device: {device}")
-            
-            model, df_state, _ = init_df()
-            enhance(model, df_state, temp_in_path, temp_out_path)
-            
-            enhanced_data, _ = sf.read(temp_out_path)
-            
-            # Unload model variables explicitly
-            del model
-            del df_state
-            
-            return enhanced_data
-        finally:
-            for p in [temp_in_path, temp_out_path]:
-                if os.path.exists(p):
-                    os.remove(p)
-                    
-    except Exception as e:
-        logger.warning(f"On-demand DeepFilterNet failed: {e}. Falling back to Fast DSP mode.")
-        return run_dsp_spectral_subtraction(noisy_16k, 16000)
-    finally:
-        # Force garbage collection
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logger.info("DeepFilterNet model unloaded from memory.")
-
-
-async def run_whisper_transcription(wav_bytes: bytes, language: str) -> Dict[str, Any]:
-    """
-    Loads faster-whisper on-demand, transcribes buffer, and unloads model to free memory.
-    """
-    logger.info("On-demand loading Whisper model...")
-    from app.transcription_router import generate_mock_transcription
-    
-    duration = 2.0
-    try:
-        audio_io = io.BytesIO(wav_bytes)
-        audio_data, fs = sf.read(audio_io)
-        duration = float(len(audio_data) / fs)
-    except Exception as e:
-        logger.warning(f"Could not parse audio properties in transcription buffer: {e}")
-        
-    try:
-        from faster_whisper import WhisperModel
-        
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-            temp_wav.write(wav_bytes)
-            temp_wav_path = temp_wav.name
-            
-        try:
-            # Force INT8 CPU model for stability and low footprint
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Initializing Whisper model on device: {device}")
-            
-            model = WhisperModel("base", device=device, compute_type="int8")
-            
-            transcribe_lang = None if language.lower() == "auto" else language.lower()
-            
-            # Run transcription inside threadpool to prevent blocking the async loop
-            loop = asyncio.get_event_loop()
-            segments, info = await loop.run_in_executor(
-                None,
-                lambda: model.transcribe(
-                    temp_wav_path,
-                    beam_size=5,
-                    language=transcribe_lang,
-                    word_timestamps=True
-                )
-            )
-            
-            # Extract segments
-            segments = list(segments)
-            
-            words_list = []
-            transcript_parts = []
-            
-            for segment in segments:
-                transcript_parts.append(segment.text)
-                if segment.words:
-                    for w in segment.words:
-                        words_list.append({
-                            "word": w.word.strip(),
-                            "start": float(w.start),
-                            "end": float(w.end),
-                            "probability": float(w.probability)
-                        })
-                else:
-                    segment_words = segment.text.split()
-                    if segment_words:
-                        word_dur = (segment.end - segment.start) / len(segment_words)
-                        for idx, word in enumerate(segment_words):
-                            words_list.append({
-                                "word": word,
-                                "start": float(segment.start + idx * word_dur),
-                                "end": float(segment.start + (idx + 1) * word_dur),
-                                "probability": 0.90
-                            })
-                            
-            full_text = " ".join(transcript_parts).strip()
-            
-            # Unload Whisper model
-            del model
-            
-            return {
-                "text": sanitize_transcription_text(full_text) if full_text else "(No speech detected)",
-                "language": info.language,
-                "words": words_list
-            }
-            
-        finally:
-            if os.path.exists(temp_wav_path):
-                os.remove(temp_wav_path)
-                
-    except Exception as e:
-        logger.warning(f"On-demand Whisper failed: {e}. Executing mock fallback transcription.")
-        return generate_mock_transcription(duration, language)
-    finally:
-        # Force garbage collection
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logger.info("Whisper model unloaded from memory.")
-
 # ----------------- SPECTROGRAM UTILITY -----------------
-
-def get_compact_spectrogram(data: np.ndarray) -> list:
-    """
-    Computes magnitude spectrogram and resamples it to 40x80 compact matrix.
-    """
-    stft_matrix = np.abs(librosa.stft(data, n_fft=512, hop_length=256))
-    stft_db = librosa.amplitude_to_db(stft_matrix, ref=np.max)
-    freq_indices = np.linspace(0, stft_db.shape[0] - 1, 40, dtype=int)
-    time_indices = np.linspace(0, stft_db.shape[1] - 1, 80, dtype=int)
-    compact_spec = stft_db[freq_indices, :][:, time_indices]
-    min_db, max_db = np.min(compact_spec), np.max(compact_spec)
-    db_range = max_db - min_db if max_db > min_db else 1.0
-    return ((compact_spec - min_db) / db_range).tolist()
 
 # ----------------- CORE JOB PROCESSOR -----------------
 
