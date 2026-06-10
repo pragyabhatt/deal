@@ -71,4 +71,4 @@ The DEAL quality assessment engine strictly routes uploaded signals through stan
 
 1. **Signal-to-Noise (SNR)**: RMS calculations evaluated at original sampling rate.
 2. **PESQ (Mean Opinion Score)**: Automated fractional downsampling using `scipy.signal.resample_poly` to **16000 Hz** (wide-band MOS models) to avoid standard library crash signatures.
-3. **STOI (Intelligibility Index)**: Decimated/resampled to **16000 Hz** (wide-band spectrum) to maintain alignment with standard objective scoring ranges.
+3. **STOI (Intelligibility Index)**: Decimated/resampled to **16000 Hz** (wide-band spectrum) to maintain alignment with standard objective scoring ranges. 
